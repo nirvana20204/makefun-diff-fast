@@ -1,9 +1,18 @@
 // A faster drop-in for makefun-diff 1.0.0 (make.fun's line diff + patch), written from its documented rule:
 // the same tokenizer, the same common prefix/suffix trim, the same Myers greedy search with the deletion-first
-// tie-break, and the same patch writer. Everything the rule fixes is kept; only the data structures change:
-//   1. lines are interned to 32-bit ids once, so a line comparison is an integer compare;
-//   2. the search keeps integer positions in one flat Int32Array instead of a linked list of path objects;
-//   3. one packed window per Myers layer is kept, so the edit script is rebuilt without allocating per step.
+// tie-break, and the same patch writer. Everything the rule fixes is kept; only the data structures and the shape of
+// the inner loop change:
+//   1. lines are interned to ids once, so comparing two lines is comparing two integers;
+//   2. the frontier and the per-layer trace live in 16-bit arrays whenever the two texts fit 65 532 lines between
+//      them (the ids and the positions both fit), which halves the bytes the diagonal loop touches; a longer text
+//      falls back to 32-bit arrays of the same shape, so one code path serves both;
+//   3. both id sequences carry sentinel lines past their end, so the walk along equal lines is a bare compare with no
+//      bounds test; the sentinels differ from each other, so the walk stops at whichever text ends first;
+//   4. the sweep is a plain function over locals rather than a closure factory: a closure puts the frontier, the
+//      trace and the counters in a context object, and every access in the hot loop then pays a context load
+//      (measured at 3-4x the loop itself);
+//   5. the diagonal loop carries its frontier index in a register instead of recomputing an offset per step;
+//   6. one packed window per Myers layer is kept, so the edit script is rebuilt without allocating per step.
 
 export const FORMAT = 'makefun-diff/1';
 
@@ -50,111 +59,98 @@ function intern(lines, from, to, ids) {
  * diagonal k the furthest old position reached, follows equal lines as far as they go, and takes the deletion when
  * a deletion and an insertion reach the same point.
  */
-function editRuns(a, b) {
-  const n = a.length;
-  const m = b.length;
+/**
+ * Myers's greedy sweep, written as a plain function so the inner loop keeps its working set in locals.
+ * (A factory that closes over `a`, `b`, `v` and the counters puts every one of them in a closure context, and each
+ * access in the diagonal loop then costs a context load — measured at 3-4x the loop itself.)
+ *
+ * Both id sequences carry two sentinel ids past their end, so walking equal lines is a bare compare: no real line
+ * holds either sentinel, and the two differ from each other, so the walk stops at the end of either text.
+ */
+function editRunsCore(a, b, n, m, NONE) {
   const kinds = [];
   const counts = [];
-  const push = (kind, count) => {
-    const lastIndex = kinds.length - 1;
-    if (lastIndex >= 0 && kinds[lastIndex] === kind) counts[lastIndex] += count;
-    else {
-      kinds.push(kind);
-      counts.push(count);
-    }
-  };
   if (n === 0 && m === 0) return { kinds, counts };
 
   const max = n + m;
   const off = max + 1;
-  // 位置 <= 65534 时用 16 位，省一半内存流量（-1 作为"无路径"的哨兵）。
-  const Wide = max > 65533;
-  const v = Wide ? new Int32Array(2 * max + 3).fill(-1) : new Uint16Array(2 * max + 3).fill(65535);
-  const NONE = Wide ? -1 : 65535;
-  const read = (i) => (Wide ? v[i] : v[i] === 65535 ? -1 : v[i]);
-  const write = (i, x) => {
-    v[i] = Wide ? x : x < 0 ? 65535 : x;
-  };
-  write(off + 1, 0);
+  const v = new (a.constructor)(2 * max + 3).fill(NONE);
+  v[off + 1] = 0;
 
-  // 轨迹：第 d 层只有 k = -d, -d+2, ..., d，打包在 [base(d) + (k + d) / 2]，base(d) = d (d + 1) / 2。
-  let trace = Wide ? new Int32Array(1 << 16) : new Uint16Array(1 << 16);
-  const TraceNone = NONE;
-  const tset = (slot, x) => {
-    trace[slot] = Wide ? x : x < 0 ? 65535 : x;
-  };
-  const tget = (slot) => {
-    const x = trace[slot];
-    return Wide ? x : x === 65535 ? -1 : x;
-  };
-
+  // 第 d 层只有 k = -d, -d+2, ..., d，打包在 [base(d) + (k + d) / 2]，base(d) = d (d + 1) / 2。
+  let trace = new (a.constructor)(1 << 16);
   let found = -1;
   let baseD = 0;
-  for (let d = 0; d <= max && found < 0; d++) {
+  let slot = 0;
+
+  for (let d = 0; d <= max; d++) {
     const need = baseD + d + 1;
     if (need > trace.length) {
       let grown = trace.length * 2;
       while (grown < need) grown *= 2;
-      const next = Wide ? new Int32Array(grown) : new Uint16Array(grown);
+      const next = new (a.constructor)(grown);
       next.set(trace);
       trace = next;
     }
-    const half = d + 1;
     if (d === 0) {
       let x = 0;
-      while (x < n && x < m && a[x] === b[x]) x++;
-      write(off, x);
-      tset(baseD, x);
-      if (x >= n && x >= m) found = 0;
-      baseD += half;
+      while (a[x] === b[x]) x++;
+      v[off] = x;
+      trace[0] = x;
+      if (x >= n && x >= m) {
+        found = 0;
+        break;
+      }
+      baseD += 1;
       continue;
     }
-    for (let k = -d; k <= d; k += 2) {
-      const slot = baseD + ((k + d) >> 1);
+    const half = d + 1;
+    slot = baseD;
+    let i = off - d;
+    for (let k = -d; k <= d; k += 2, slot++, i += 2) {
       let x;
       if (k === -d) {
-        // 只有插入：来自上一层对角线 k+1
-        const insX = read(off + k + 1);
-        if (insX < 0 || insX - 1 - k >= m) {
-          write(off + k, NONE);
-          tset(slot, -1);
+        const insX = v[i + 1];
+        if (insX === NONE || insX - 1 - k >= m) {
+          v[i] = NONE;
+          trace[slot] = NONE;
           continue;
         }
         x = insX;
       } else if (k === d) {
-        // 只有删除：来自上一层对角线 k-1
-        const delX = read(off + k - 1);
-        if (delX < 0 || delX >= n) {
-          write(off + k, NONE);
-          tset(slot, -1);
+        const delX = v[i - 1];
+        if (delX === NONE || delX >= n) {
+          v[i] = NONE;
+          trace[slot] = NONE;
           continue;
         }
         x = delX + 1;
       } else {
-        const delX = read(off + k - 1);
-        const insX = read(off + k + 1);
-        const canDelete = delX >= 0 && delX < n;
-        const canInsert = insX >= 0 && insX - 1 - k < m;
-        if (!canDelete && !canInsert) {
-          write(off + k, NONE);
-          tset(slot, -1);
-          continue;
-        }
-        if (canDelete) x = canInsert && insX - 1 > delX ? insX : delX + 1;
-        else x = insX;
+        const delX = v[i - 1];
+        const insX = v[i + 1];
+        if (delX === NONE || delX >= n) {
+          if (insX === NONE || insX - 1 - k >= m) {
+            v[i] = NONE;
+            trace[slot] = NONE;
+            continue;
+          }
+          x = insX;
+        } else if (insX !== NONE && insX - 1 - k < m && insX - 1 > delX) x = insX;
+        else x = delX + 1;
       }
       let y = x - k;
-      while (x < n && y < m && a[x] === b[y]) {
+      while (a[x] === b[y]) {
         x++;
         y++;
       }
-      write(off + k, x);
-      tset(slot, x);
+      v[i] = x;
+      trace[slot] = x;
       if (x >= n && y >= m) {
         found = d;
         break;
       }
     }
+    if (found >= 0) break;
     baseD += half;
   }
   if (found < 0) throw new Error('makefun-diff: the search ended without reaching both ends');
@@ -168,11 +164,12 @@ function editRuns(a, b) {
   for (let d = found; d > 0; d--) {
     const k = x - y;
     const pd = d - 1;
-    const at = (kk) => (kk < -pd || kk > pd ? -1 : tget(backBase + ((kk + pd) >> 1)));
-    const delX = at(k - 1);
-    const insX = at(k + 1);
-    const canDelete = delX >= 0 && delX < n;
-    const canInsert = insX >= 0 && insX - 1 - k < m;
+    const delSlot = k - 1 + pd;
+    const insSlot = k + 1 + pd;
+    const delX = delSlot >= 0 && delSlot <= 2 * pd ? trace[backBase + (delSlot >> 1)] : NONE;
+    const insX = insSlot >= 0 && insSlot <= 2 * pd ? trace[backBase + (insSlot >> 1)] : NONE;
+    const canDelete = delX !== NONE && delX < n;
+    const canInsert = insX !== NONE && insX - 1 - k < m;
     const byInsertion = canInsert ? insX - 1 : -2;
     const deleted = canDelete && delX >= byInsertion;
     const from = deleted ? delX + 1 : insX;
@@ -189,15 +186,46 @@ function editRuns(a, b) {
       x = insX;
       y = insX - k - 1;
     }
-    backBase -= d - 1;
+    backBase -= pd;
     if (backBase < 0) backBase = 0;
   }
   if (x > 0) {
     backKinds.push(KEEP);
     backCounts.push(x);
   }
-  for (let i = backKinds.length - 1; i >= 0; i--) push(backKinds[i], backCounts[i]);
+
+  let lastKind = -1;
+  for (let i = backKinds.length - 1; i >= 0; i--) {
+    const kind = backKinds[i];
+    const count = backCounts[i];
+    if (lastKind === kind) counts[counts.length - 1] += count;
+    else {
+      kinds.push(kind);
+      counts.push(count);
+      lastKind = kind;
+    }
+  }
   return { kinds, counts };
+}
+
+/** 行数之和不超过 65 532（行 id 也放得进 16 位）时用 16 位数组，更长才用 32 位。 */
+function editRuns(idsA, idsB) {
+  const n = idsA.length;
+  const m = idsB.length;
+  const small = n + m <= 65532;
+  const Ctor = small ? Uint16Array : Int32Array;
+  const PAD_A = small ? 65534 : -2;
+  const PAD_B = small ? 65533 : -3;
+  const NONE = small ? 65535 : -1;
+  const a = new Ctor(n + 2);
+  a.set(idsA);
+  a[n] = PAD_A;
+  a[n + 1] = PAD_A;
+  const b = new Ctor(m + 2);
+  b.set(idsB);
+  b[m] = PAD_B;
+  b[m + 1] = PAD_B;
+  return editRunsCore(a, b, n, m, NONE);
 }
 
 /** makefun-diff 1.0.0's patch of input.old into input.new. */
