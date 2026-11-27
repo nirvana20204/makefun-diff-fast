@@ -5,8 +5,9 @@
 [![reward](https://make.fun/badge/diff-speed-01-run-20261126/nirvana20204/makefun-diff-fast/reward.svg)](https://make.fun/bounty/diff-speed-01-run-20261126?utm_source=github&utm_medium=readme&utm_campaign=diff-speed-01-run-20261126)
 
 A faster drop-in for makefun-diff 1.0.0: `solve.js` returns makefun-diff's answer for every `{ old, new }`, byte for
-byte, and answers the practice instance's four cases in about a third of the house baseline's CPU time — 353 ms against
-1213 ms, medians of seven alternating runs of both on this box, 314 ms at best.
+byte, and answers the practice instance's four cases in about a quarter of the house baseline's CPU time — 373 ms of
+CPU against 1342 ms, the best of seven alternating runs of both on this box, and the whole run (startup, input, solver,
+answers) in about 700 ms.
 
 The rule is kept exactly — the same tokenizer (`\n` after every line, `\r` part of its line, a last line without a
 newline is a line), the same longest common prefix and suffix trim, the same Myers greedy search (furthest into the
@@ -16,15 +17,20 @@ insertions, `%` after a line that has no newline). Only the data structures chan
 
 1. every line is interned to an id once, so a line comparison is an integer compare;
 2. the frontier and the per-layer trace are 16-bit arrays whenever the two texts fit 65 532 lines between them, which
-   halves the bytes the diagonal loop touches; a longer text uses 32-bit arrays of the same shape, one code path for
-   both;
-3. both id sequences carry sentinel lines past their end, so the walk along equal lines is a bare compare with no
+   halves the bytes the diagonal loop touches; a longer text uses a 32-bit copy of the same loop;
+3. both id sequences carry two sentinel ids past their end, so the walk along equal lines is a bare compare with no
    bounds test, and the two sentinels differ so the walk stops at whichever text ends first;
-4. the sweep is a plain function over locals rather than a closure factory — closing over the frontier, the trace and
-   the counters puts them in a context object, and each access in the hot loop then pays a context load (3-4x the
-   loop itself, measured);
-5. the diagonal loop keeps its frontier index in a register instead of recomputing an offset per step;
-6. one packed window per Myers layer is kept, so the edit script is rebuilt without per-step allocation.
+4. the sweep is a plain function over locals rather than a closure over them — a closure puts the frontier, the trace
+   and the counters in a context object, and each access in the hot loop then pays a context load (3-4x the loop);
+5. the 16-bit and 32-bit loops are written twice instead of sharing one body: a body that receives either array type
+   pays a map check on every element touch (measured at 1.5x on this data);
+6. each layer carries its frontier index in a register instead of recomputing an offset per step, and its two end
+   diagonals (pure insertion, pure deletion) are lifted out of the bulk loop;
+7. one packed window per layer is kept, so the edit script is rebuilt from the trace without per-step allocation.
+
+Two things that looked like wins and are not, on this data: interning by string comparison instead of ids (the walk
+along equal lines then compares string contents, 1.4x slower overall), and 32-bit arrays for the frontier (2x the memory
+traffic of the 16-bit copy, 1.6x slower).
 
 `main.ts` is the house driver: it reads `/input/cases.json`, answers each case with `run`, and writes
 `/output/answers.json`.
